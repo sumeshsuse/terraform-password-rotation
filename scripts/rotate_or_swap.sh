@@ -44,3 +44,41 @@ esac
 echo "active_slot: $active -> $new_active"
 echo "rotation_a:  $rotation_a -> $new_a"
 echo "rotation_b:  $rotation_b -> $new_b"
+
+for tool in terraform jq; do
+  command -v "$tool" >/dev/null || { echo "error: $tool is not installed" >&2; exit 1; }
+done
+
+plan="guard.tfplan"
+trap 'rm -f "$dir/$plan"' EXIT
+
+terraform -chdir="$dir" plan -input=false -out="$plan" \
+  -var "active_slot=$new_active" \
+  -var "rotation_a=$new_a" \
+  -var "rotation_b=$new_b" >/dev/null
+
+changed=$(terraform -chdir="$dir" show -json "$plan" \
+  | jq -r '.resource_changes[]? | select(.change.actions != ["no-op"]) | .address')
+
+echo "resources that change: ${changed:-none}"
+
+if grep -q "random_password.slot_${new_active}$" <<<"$changed"; then
+  echo "BLOCKED: this plan would replace the live password in slot $new_active" >&2
+  exit 1
+fi
+
+echo "OK: the live password is untouched"
+
+terraform -chdir="$dir" apply -input=false "$plan"
+
+sed -i.bak -E \
+  -e "s/^(active_slot[[:space:]]*=[[:space:]]*).*/\1\"$new_active\"/" \
+  -e "s/^(rotation_a[[:space:]]*=[[:space:]]*).*/\1$new_a/" \
+  -e "s/^(rotation_b[[:space:]]*=[[:space:]]*).*/\1$new_b/" \
+  "$tfvars"
+rm -f "$tfvars.bak"
+
+live=$(terraform -chdir="$dir" output -raw active_slot)
+[[ "$live" == "$new_active" ]] || { echo "error: expected active slot $new_active after apply, got $live" >&2; exit 1; }
+
+echo "DONE: $action applied, live slot is $live, $tfvars updated"
