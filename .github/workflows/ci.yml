@@ -1,0 +1,67 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  module:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Format
+        run: terraform fmt -check -recursive
+
+      - name: Validate
+        run: |
+          terraform -chdir=modules/password-rotation init -input=false
+          terraform -chdir=modules/password-rotation validate
+
+      - name: Test
+        run: terraform -chdir=modules/password-rotation test
+
+  guard-script:
+    runs-on: ubuntu-latest
+    needs: module
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Shellcheck
+        run: shellcheck scripts/rotate_or_swap.sh
+
+      - name: Create both slots
+        run: |
+          terraform -chdir=examples/basic init -input=false
+          terraform -chdir=examples/basic apply -input=false -auto-approve
+
+      - name: Rotate changes only the backup
+        run: |
+          ./scripts/rotate_or_swap.sh rotate
+          grep -Eq '^rotation_b[[:space:]]*=[[:space:]]*2$' examples/basic/terraform.tfvars
+
+      - name: Swap makes the backup live
+        run: |
+          ./scripts/rotate_or_swap.sh swap
+          grep -Eq '^active_slot[[:space:]]*=[[:space:]]*"b"$' examples/basic/terraform.tfvars
+
+      - name: Guard blocks a change to the live password
+        run: |
+          sed -i -E 's/^(rotation_b[[:space:]]*=[[:space:]]*).*/\19/' examples/basic/terraform.tfvars
+          if ./scripts/rotate_or_swap.sh rotate; then
+            echo "guard did not block a change to the live slot" >&2
+            exit 1
+          fi
